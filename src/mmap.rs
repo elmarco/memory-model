@@ -8,7 +8,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
-//! A default implementation of GuestMemory by mmap()-ing guest's memory into current process.
+//! A default implementation of AddressSpace by mmap()-ing guest's memory into current process.
 //!
 //! The main structs to access guest's memory are:
 //! - MmapRegion: mmap a continuous region of guest's memory into current process
@@ -18,24 +18,15 @@
 use libc;
 use std::io::{self, Read, Write};
 use std::mem;
-use std::ops::{BitAnd, BitOr};
 use std::os::unix::io::AsRawFd;
 use std::ptr::null_mut;
 use std::sync::Arc;
 
-use address_space::{Address, AddressRegion, AddressSpace, AddressValue};
+use address::Address;
 use guest_memory::*;
-use volatile_memory::*;
+use volatile_memory::{self, calc_offset, VolatileMemory, VolatileSlice};
+use Bytes;
 use DataInit;
-
-type MmapAddressValue = <MmapAddress as AddressValue>::V;
-type Result<T> = std::result::Result<T, Error>;
-
-/// Represents an offset into a memory mapped area.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub struct MmapAddress(pub usize);
-
-impl_address_ops!(MmapAddress, usize);
 
 /// A backend driver to access guest's physical memory by mmapping guest's memory into current
 /// process.
@@ -137,262 +128,17 @@ impl MmapRegion {
         // overflow. However, it is possible to alias.
         std::slice::from_raw_parts_mut(self.addr, self.size)
     }
-
-    // Check that addr + count is valid and return the sum.
-    fn region_end(&self, addr: usize, count: usize) -> Result<usize> {
-        let end = addr
-            .checked_add(count)
-            .ok_or_else(|| Error::InvalidBackendAddress)?;
-        if end > self.size {
-            return Err(Error::InvalidBackendAddress);
-        }
-        Ok(end)
-    }
-}
-
-impl AddressRegion for MmapRegion {
-    type A = MmapAddress;
-    type E = Error;
-
-    fn size(&self) -> MmapAddressValue {
-        self.size
-    }
-
-    fn max_addr(&self) -> MmapAddress {
-        MmapAddress(self.size)
-    }
-
-    fn is_valid(&self) -> bool {
-        !self.addr.is_null() && self.addr != libc::MAP_FAILED as *mut u8
-    }
-
-    /// Writes a slice to the region at the specified address.
-    /// Returns the number of bytes written. The number of bytes written can
-    /// be less than the length of the slice if there isn't enough room in the
-    /// region.
-    ///
-    /// # Examples
-    /// * Write a slice at offset 256.
-    ///
-    /// ```
-    /// #   use memory_model::{AddressRegion, MmapAddress, MmapRegion};
-    /// #   let mut mem_map = MmapRegion::new(1024).unwrap();
-    ///     let res = mem_map.write(&[1,2,3,4,5], MmapAddress(1020));
-    ///     assert!(res.is_ok());
-    ///     assert_eq!(res.unwrap(), 4);
-    /// ```
-    fn write(&self, buf: &[u8], addr: MmapAddress) -> Result<usize> {
-        if addr.raw_value() >= self.size {
-            return Err(Error::InvalidBackendAddress);
-        }
-        unsafe {
-            // Guest memory can't strictly be modeled as a slice because it is
-            // volatile.  Writing to it with what compiles down to a memcpy
-            // won't hurt anything as long as we get the bounds checks right.
-            let mut slice: &mut [u8] = &mut self.as_mut_slice()[addr.raw_value()..];
-            Ok(slice.write(buf).map_err(Error::IOError)?)
-        }
-    }
-
-    /// Reads to a slice from the region at the specified address.
-    /// Returns the number of bytes read. The number of bytes read can be less than the length
-    /// of the slice if there isn't enough room in the region.
-    ///
-    /// # Examples
-    /// * Read a slice of size 16 at offset 256.
-    ///
-    /// ```
-    /// #   use memory_model::{AddressRegion, MmapAddress, MmapRegion};
-    /// #   let mut mem_map = MmapRegion::new(1024).unwrap();
-    ///     let buf = &mut [0u8; 16];
-    ///     let res = mem_map.read(buf, MmapAddress(1010));
-    ///     assert!(res.is_ok());
-    ///     assert_eq!(res.unwrap(), 14);
-    /// ```
-    fn read(&self, mut buf: &mut [u8], addr: MmapAddress) -> Result<usize> {
-        if addr.raw_value() >= self.size {
-            return Err(Error::InvalidBackendAddress);
-        }
-        unsafe {
-            // Guest memory can't strictly be modeled as a slice because it is
-            // volatile.  Writing to it with what compiles down to a memcpy
-            // won't hurt anything as long as we get the bounds checks right.
-            let slice: &[u8] = &self.as_slice()[addr.raw_value()..];
-            Ok(buf.write(slice).map_err(Error::IOError)?)
-        }
-    }
-
-    /// Writes a slice to the region at the specified address.
-    ///
-    /// # Examples
-    /// * Write a slice at offset 256.
-    ///
-    /// ```
-    /// #   use memory_model::{AddressRegion, MmapAddress, MmapRegion};
-    /// #   let mut mem_map = MmapRegion::new(1024).unwrap();
-    ///     let res = mem_map.write_slice(&[1,2,3,4,5], MmapAddress(256));
-    ///     assert!(res.is_ok());
-    ///     assert_eq!(res.unwrap(), ());
-    /// ```
-    fn write_slice(&self, buf: &[u8], addr: MmapAddress) -> Result<()> {
-        let len = self.write(buf, addr)?;
-        if len != buf.len() {
-            return Err(Error::PartialBuffer {
-                expected: buf.len() as u64,
-                completed: len as u64,
-            });
-        }
-        Ok(())
-    }
-
-    /// Reads to a slice from the region at the specified address.
-    ///
-    /// # Examples
-    /// * Read a slice of size 16 at offset 256.
-    ///
-    /// ```
-    /// #   use memory_model::{AddressRegion, MmapAddress, MmapRegion};
-    /// #   let mut mem_map = MmapRegion::new(1024).unwrap();
-    ///     let buf = &mut [0u8; 16];
-    ///     let res = mem_map.read_slice(buf, MmapAddress(256));
-    ///     assert!(res.is_ok());
-    ///     assert_eq!(res.unwrap(), ());
-    /// ```
-    fn read_slice(&self, buf: &mut [u8], addr: MmapAddress) -> Result<()> {
-        let len = self.read(buf, addr)?;
-        if len != buf.len() {
-            return Err(Error::PartialBuffer {
-                expected: buf.len() as u64,
-                completed: len as u64,
-            });
-        }
-        Ok(())
-    }
-
-    /// Writes an object to the region at the specified address.
-    /// Returns Ok(()) if the object fits, or Err if it extends past the end.
-    ///
-    /// # Examples
-    /// * Write a u64 at offset 16.
-    ///
-    /// ```
-    /// #   use memory_model::{AddressRegion, MmapAddress, MmapRegion};
-    /// #   let mut mem_map = MmapRegion::new(1024).unwrap();
-    ///     let res = mem_map.write_obj(55u64, MmapAddress(16));
-    ///     assert!(res.is_ok());
-    /// ```
-    fn write_obj<T: DataInit>(&self, val: T, addr: MmapAddress) -> Result<()> {
-        unsafe {
-            // Guest memory can't strictly be modeled as a slice because it is
-            // volatile.  Writing to it with what compiles down to a memcpy
-            // won't hurt anything as long as we get the bounds checks right.
-            self.region_end(addr.raw_value(), mem::size_of::<T>())?;
-            std::ptr::write_volatile(
-                &mut self.as_mut_slice()[addr.raw_value()..] as *mut _ as *mut T,
-                val,
-            );
-            Ok(())
-        }
-    }
-
-    /// Reads an object from the region at the given address.
-    /// Reading from a volatile area isn't strictly safe as it could change mid-read.
-    /// However, as long as the type T is plain old data and can handle random initialization,
-    /// everything will be OK.
-    ///
-    /// # Examples
-    /// * Read a u64 written to offset 32.
-    ///
-    /// ```
-    /// #   use memory_model::{AddressRegion, MmapAddress, MmapRegion};
-    /// #   let mut mem_map = MmapRegion::new(1024).unwrap();
-    ///     let res = mem_map.write_obj(55u64, MmapAddress(32));
-    ///     assert!(res.is_ok());
-    ///     let num: u64 = mem_map.read_obj(MmapAddress(32)).unwrap();
-    ///     assert_eq!(55, num);
-    /// ```
-    fn read_obj<T: DataInit>(&self, addr: MmapAddress) -> Result<T> {
-        self.region_end(addr.raw_value(), mem::size_of::<T>())?;
-        unsafe {
-            // This is safe because by definition Copy types can have their bits
-            // set arbitrarily and still be valid.
-            Ok(std::ptr::read_volatile(
-                &self.as_slice()[addr.raw_value()..] as *const _ as *const T,
-            ))
-        }
-    }
-
-    /// Writes data from a readable object like a File and writes it to the region.
-    ///
-    /// # Examples
-    ///
-    /// * Read bytes from /dev/urandom
-    ///
-    /// ```
-    /// # use memory_model::{AddressRegion, MmapAddress, MmapRegion};
-    /// # use std::fs::File;
-    /// # use std::path::Path;
-    /// # fn test_read_random() -> Result<u32, ()> {
-    /// #     let mut mem_map = MmapRegion::new(1024).unwrap();
-    ///       let mut file = File::open(Path::new("/dev/urandom")).map_err(|_| ())?;
-    ///       mem_map.write_from_stream(MmapAddress(32), &mut file, 128).map_err(|_| ())?;
-    ///       let rand_val: u32 =  mem_map.read_obj(MmapAddress(40)).map_err(|_| ())?;
-    /// #     Ok(rand_val)
-    /// # }
-    /// ```
-    fn write_from_stream<F>(&self, addr: MmapAddress, src: &mut F, count: usize) -> Result<()>
-    where
-        F: Read,
-    {
-        let end = self.region_end(addr.raw_value(), count)?;
-        unsafe {
-            // It is safe to overwrite the volatile memory. Accessing the guest
-            // memory as a mutable slice is OK because nothing assumes another
-            // thread won't change what is loaded.
-            let dst = &mut self.as_mut_slice()[addr.raw_value()..end];
-            src.read_exact(dst).map_err(Error::IOError)?;
-        }
-        Ok(())
-    }
-
-    /// Reads data from the region to a writable object.
-    ///
-    /// # Examples
-    ///
-    /// * Write 128 bytes to /dev/null
-    ///
-    /// ```
-    /// # use memory_model::{AddressRegion, MmapAddress, MmapRegion};
-    /// # use std::fs::File;
-    /// # use std::path::Path;
-    /// # fn test_write_null() -> Result<(), ()> {
-    /// #     let mut mem_map = MmapRegion::new(1024).unwrap();
-    ///       let mut file = File::open(Path::new("/dev/null")).map_err(|_| ())?;
-    ///       mem_map.read_into_stream(MmapAddress(32), &mut file, 128).map_err(|_| ())?;
-    /// #     Ok(())
-    /// # }
-    /// ```
-    fn read_into_stream<F>(&self, addr: MmapAddress, dst: &mut F, count: usize) -> Result<()>
-    where
-        F: Write,
-    {
-        let end = self.region_end(addr.raw_value(), count)?;
-        unsafe {
-            // It is safe to read from volatile memory. Accessing the guest
-            // memory as a slice is OK because nothing assumes another thread
-            // won't change what is loaded.
-            let src = &self.as_mut_slice()[addr.raw_value()..end];
-            dst.write_all(src).map_err(Error::IOError)?;
-        }
-        Ok(())
-    }
 }
 
 impl VolatileMemory for MmapRegion {
-    fn get_slice(&self, offset: usize, count: usize) -> VolatileMemoryResult<VolatileSlice> {
+    fn len(&self) -> usize {
+        self.size
+    }
+
+    fn get_slice(&self, offset: usize, count: usize) -> volatile_memory::Result<VolatileSlice> {
         let end = calc_offset(offset, count)?;
         if end > self.size {
-            return Err(VolatileMemoryError::OutOfBounds { addr: end });
+            return Err(volatile_memory::Error::OutOfBounds { addr: end });
         }
 
         // Safe because we checked that offset + count was within our range and we only ever hand
@@ -420,7 +166,7 @@ pub struct GuestRegionMmap {
 
 impl GuestRegionMmap {
     /// Create a new memory-mapped memory region for guest's physical memory.
-    /// Note: caller needs to ensure that (mapping.size() + guest_base) doesn't wrapping around.
+    /// Note: caller needs to ensure that (mapping.len() + guest_base) doesn't wrapping around.
     pub fn new(mapping: MmapRegion, guest_base: GuestAddress) -> Self {
         GuestRegionMmap {
             mapping,
@@ -428,14 +174,18 @@ impl GuestRegionMmap {
         }
     }
 
-    fn to_mmap_addr(&self, addr: GuestAddress) -> Result<MmapAddress> {
+    fn to_mmap_addr(&self, addr: GuestAddress) -> Result<usize> {
         let offset = addr
             .checked_offset_from(self.guest_base)
             .ok_or_else(|| Error::InvalidGuestAddress(addr))?;
-        if offset >= self.size() {
+        if offset >= self.len() {
             return Err(Error::InvalidGuestAddress(addr));
         }
-        Ok(MmapAddress(offset as usize))
+        Ok(offset as usize)
+    }
+
+    fn as_volatile_slice(&self) -> VolatileSlice {
+        self.mapping.as_volatile_slice()
     }
 
     unsafe fn as_slice(&self) -> &[u8] {
@@ -445,14 +195,9 @@ impl GuestRegionMmap {
     unsafe fn as_mut_slice(&self) -> &mut [u8] {
         self.mapping.as_mut_slice()
     }
-}
 
-impl AddressRegion for GuestRegionMmap {
-    type A = GuestAddress;
-    type E = Error;
-
-    fn size(&self) -> GuestAddressValue {
-        self.mapping.size() as GuestAddressValue
+    fn len(&self) -> GuestAddressValue {
+        self.mapping.len() as GuestAddressValue
     }
 
     fn min_addr(&self) -> GuestAddress {
@@ -462,37 +207,41 @@ impl AddressRegion for GuestRegionMmap {
     fn max_addr(&self) -> GuestAddress {
         // unchecked_add is safe as the region bounds were checked when it was created.
         self.guest_base
-            .unchecked_add(self.mapping.size() as GuestAddressValue)
+            .unchecked_add(self.mapping.len() as GuestAddressValue)
     }
+}
+
+impl Bytes<GuestAddress> for GuestRegionMmap {
+    type E = Error;
 
     fn write(&self, buf: &[u8], addr: GuestAddress) -> Result<usize> {
         let maddr = self.to_mmap_addr(addr)?;
-        self.mapping.write(buf, maddr)
+        self.as_volatile_slice().write(buf, maddr).map_err(Into::into)
     }
 
     fn read(&self, buf: &mut [u8], addr: GuestAddress) -> Result<usize> {
         let maddr = self.to_mmap_addr(addr)?;
-        self.mapping.read(buf, maddr)
+        self.as_volatile_slice().read(buf, maddr).map_err(Into::into)
     }
 
     fn write_slice(&self, buf: &[u8], addr: GuestAddress) -> Result<()> {
         let maddr = self.to_mmap_addr(addr)?;
-        self.mapping.write_slice(buf, maddr)
+        self.as_volatile_slice().write_slice(buf, maddr).map_err(Into::into)
     }
 
     fn read_slice(&self, buf: &mut [u8], addr: GuestAddress) -> Result<()> {
         let maddr = self.to_mmap_addr(addr)?;
-        self.mapping.read_slice(buf, maddr)
+        self.as_volatile_slice().read_slice(buf, maddr).map_err(Into::into)
     }
 
     fn write_obj<T: DataInit>(&self, val: T, addr: GuestAddress) -> Result<()> {
         let maddr = self.to_mmap_addr(addr)?;
-        self.mapping.write_obj::<T>(val, maddr)
+        self.as_volatile_slice().write_obj::<T>(val, maddr).map_err(Into::into)
     }
 
     fn read_obj<T: DataInit>(&self, addr: GuestAddress) -> Result<T> {
         let maddr = self.to_mmap_addr(addr)?;
-        self.mapping.read_obj::<T>(maddr)
+        self.as_volatile_slice().read_obj::<T>(maddr).map_err(Into::into)
     }
 
     fn write_from_stream<F>(&self, addr: GuestAddress, src: &mut F, count: usize) -> Result<()>
@@ -500,7 +249,7 @@ impl AddressRegion for GuestRegionMmap {
         F: Read,
     {
         let maddr = self.to_mmap_addr(addr)?;
-        self.mapping.write_from_stream::<F>(maddr, src, count)
+        self.as_volatile_slice().write_from_stream::<F>(maddr, src, count).map_err(Into::into)
     }
 
     fn read_into_stream<F>(&self, addr: GuestAddress, dst: &mut F, count: usize) -> Result<()>
@@ -508,7 +257,7 @@ impl AddressRegion for GuestRegionMmap {
         F: Write,
     {
         let maddr = self.to_mmap_addr(addr)?;
-        self.mapping.read_into_stream::<F>(maddr, dst, count)
+        self.as_volatile_slice().read_into_stream::<F>(maddr, dst, count).map_err(Into::into)
     }
 }
 
@@ -533,7 +282,7 @@ impl GuestMemoryMmap {
             if let Some(last) = regions.last() {
                 if last
                     .guest_base
-                    .checked_add(last.mapping.size() as GuestAddressValue)
+                    .checked_add(last.mapping.len() as GuestAddressValue)
                     .map_or(true, |a| a > range.0)
                 {
                     return Err(MmapError::MemoryRegionOverlap);
@@ -553,61 +302,51 @@ impl GuestMemoryMmap {
     }
 }
 
-impl AddressRegion for GuestMemoryMmap {
-    type A = GuestAddress;
-    type E = Error;
+impl GuestMemory for GuestMemoryMmap {
+    type R = GuestRegionMmap;
 
-    fn size(&self) -> GuestAddressValue {
-        self.regions
-            .iter()
-            .map(|region| region.mapping.size() as GuestAddressValue)
-            .sum()
+    fn num_regions(&self) -> usize {
+        self.regions.len()
     }
 
-    fn min_addr(&self) -> GuestAddress {
-        self.regions
-            .iter()
-            .min_by_key(|region| region.min_addr())
-            .map_or(GuestAddress(0), |region| region.min_addr())
-    }
-
-    /// # Examples
-    ///
-    /// ```
-    /// # use memory_model::{Address, AddressRegion, GuestAddress, GuestMemoryMmap};
-    /// # fn test_end_addr() -> Result<(), ()> {
-    ///     let start_addr = GuestAddress(0x1000);
-    ///     let mut gm = GuestMemoryMmap::new(&vec![(start_addr, 0x400)]).map_err(|_| ())?;
-    ///     assert_eq!(start_addr.checked_add(0x400), Some(gm.max_addr()));
-    ///     Ok(())
-    /// # }
-    /// ```
-    fn max_addr(&self) -> GuestAddress {
-        self.regions
-            .iter()
-            .max_by_key(|region| region.max_addr())
-            .map_or(GuestAddress(0), |region| region.max_addr())
-    }
-
-    fn is_valid(&self) -> bool {
-        // TODO: verify there's no intersection among regions
-        true
-    }
-
-    fn address_in_range(&self, addr: GuestAddress) -> bool {
+    fn find_region(&self, addr: GuestAddress) -> Option<&GuestRegionMmap> {
         for region in self.regions.iter() {
             if addr >= region.min_addr() && addr < region.max_addr() {
-                return true;
+                return Some(region);
             }
         }
-        false
+        None
     }
+
+    fn with_regions<F>(&self, cb: F) -> Result<()>
+    where
+        F: Fn(usize, &GuestRegionMmap) -> Result<()>,
+    {
+        for (index, region) in self.regions.iter().enumerate() {
+            cb(index, region)?;
+        }
+        Ok(())
+    }
+
+    fn with_regions_mut<F>(&self, mut cb: F) -> Result<()>
+    where
+        F: FnMut(usize, &GuestRegionMmap) -> Result<()>,
+    {
+        for (index, region) in self.regions.iter().enumerate() {
+            cb(index, region)?;
+        }
+        Ok(())
+    }
+}
+
+impl Bytes<GuestAddress> for GuestMemoryMmap {
+    type E = Error;
 
     /// # Examples
     /// * Write a slice at guestaddress 0x200.
     ///
     /// ```
-    /// # use memory_model::{AddressRegion, GuestAddress, GuestMemoryMmap};
+    /// # use memory_model::{Bytes, GuestAddress, GuestMemoryMmap};
     /// # fn test_write_u64() -> Result<(), ()> {
     /// #   let start_addr = GuestAddress(0x1000);
     /// #   let mut gm = GuestMemoryMmap::new(&vec![(start_addr, 0x400)]).map_err(|_| ())?;
@@ -633,7 +372,7 @@ impl AddressRegion for GuestMemoryMmap {
     /// * Read a slice of length 16 at guestaddress 0x200.
     ///
     /// ```
-    /// # use memory_model::{AddressRegion, GuestAddress, GuestMemoryMmap};
+    /// # use memory_model::{Bytes, GuestAddress, GuestMemoryMmap};
     /// # fn test_write_u64() -> Result<(), ()> {
     /// #   let start_addr = GuestAddress(0x1000);
     /// #   let mut gm = GuestMemoryMmap::new(&vec![(start_addr, 0x400)]).map_err(|_| ())?;
@@ -697,7 +436,7 @@ impl AddressRegion for GuestMemoryMmap {
     }
 
     /// ```
-    /// # use memory_model::{AddressRegion, GuestAddress, GuestMemoryMmap};
+    /// # use memory_model::{Bytes, GuestAddress, GuestMemoryMmap};
     /// # fn test_write_u64() -> Result<(), ()> {
     /// #   let start_addr = GuestAddress(0x1000);
     /// #   let mut gm = GuestMemoryMmap::new(&vec![(start_addr, 0x400)]).map_err(|_| ())?;
@@ -720,7 +459,7 @@ impl AddressRegion for GuestMemoryMmap {
     /// * Read a u64 from two areas of guest memory backed by separate mappings.
     ///
     /// ```
-    /// # use memory_model::{AddressRegion, GuestAddress, GuestMemoryMmap};
+    /// # use memory_model::{Bytes, GuestAddress, GuestMemoryMmap};
     /// # fn test_read_u64() -> Result<u64, ()> {
     /// #     let start_addr1 = GuestAddress(0x0);
     /// #     let start_addr2 = GuestAddress(0x400);
@@ -745,7 +484,7 @@ impl AddressRegion for GuestMemoryMmap {
     /// * Read bytes from /dev/urandom
     ///
     /// ```
-    /// # use memory_model::{Address, AddressRegion, GuestAddress, GuestMemoryMmap};
+    /// # use memory_model::{Address, Bytes, GuestAddress, GuestMemoryMmap};
     /// # use std::fs::File;
     /// # use std::path::Path;
     /// # fn test_read_random() -> Result<u32, ()> {
@@ -793,13 +532,14 @@ impl AddressRegion for GuestMemoryMmap {
     /// * Write 128 bytes to /dev/null
     ///
     /// ```
-    /// # use memory_model::{AddressRegion, MmapAddress, MmapRegion};
+    /// # use memory_model::{Address, Bytes, GuestAddress, GuestMemoryMmap};
     /// # use std::fs::File;
     /// # use std::path::Path;
     /// # fn test_write_null() -> Result<(), ()> {
-    /// #     let mut mem_map = MmapRegion::new(1024).unwrap();
+    /// #     let start_addr = GuestAddress(0x1000);
+    /// #     let gm = GuestMemoryMmap::new(&vec![(start_addr, 0x400)]).map_err(|_| ())?;
     ///       let mut file = File::open(Path::new("/dev/null")).map_err(|_| ())?;
-    ///       mem_map.read_into_stream(MmapAddress(32), &mut file, 128).map_err(|_| ())?;
+    ///       gm.read_into_stream(start_addr, &mut file, 128).map_err(|_| ())?;
     /// #     Ok(())
     /// # }
     /// ```
@@ -833,46 +573,6 @@ impl AddressRegion for GuestMemoryMmap {
         Ok(())
     }
 }
-
-impl AddressSpace<GuestAddress, Error> for GuestMemoryMmap {
-    type T = GuestRegionMmap;
-
-    fn num_regions(&self) -> usize {
-        self.regions.len()
-    }
-
-    fn find_region(&self, addr: GuestAddress) -> Option<&Self::T> {
-        for region in self.regions.iter() {
-            if addr >= region.min_addr() && addr < region.max_addr() {
-                return Some(region);
-            }
-        }
-        None
-    }
-
-    fn with_regions<F>(&self, cb: F) -> Result<()>
-    where
-        F: Fn(usize, &Self::T) -> Result<()>,
-    {
-        for (index, region) in self.regions.iter().enumerate() {
-            cb(index, region)?;
-        }
-        Ok(())
-    }
-
-    fn with_regions_mut<F>(&self, mut cb: F) -> Result<()>
-    where
-        F: FnMut(usize, &Self::T) -> Result<()>,
-    {
-        for (index, region) in self.regions.iter().enumerate() {
-            cb(index, region)?;
-        }
-        Ok(())
-    }
-}
-
-impl GuestMemory for GuestMemoryMmap {}
-
 #[cfg(test)]
 mod tests {
     extern crate tempfile;
@@ -884,10 +584,12 @@ mod tests {
     use std::os::unix::io::FromRawFd;
     use std::path::Path;
 
+    use Bytes;
+
     #[test]
     fn basic_map() {
         let m = MmapRegion::new(1024).unwrap();
-        assert_eq!(1024, m.size());
+        assert_eq!(1024, m.len());
     }
 
     #[test]
@@ -904,132 +606,10 @@ mod tests {
     }
 
     #[test]
-    fn slice_size() {
-        let m = MmapRegion::new(5).unwrap();
-        let s = m.get_slice(2, 3).unwrap();
-        assert_eq!(s.size(), 3);
-    }
-
-    #[test]
     fn slice_addr() {
         let m = MmapRegion::new(5).unwrap();
         let s = m.get_slice(2, 3).unwrap();
         assert_eq!(s.as_ptr(), unsafe { m.as_ptr().offset(2) });
-    }
-
-    #[test]
-    fn slice_store() {
-        let m = MmapRegion::new(5).unwrap();
-        let r = m.get_ref(2).unwrap();
-        r.store(9u16);
-        assert_eq!(m.read_obj::<u16>(MmapAddress(2)).unwrap(), 9);
-    }
-
-    #[test]
-    fn slice_overflow_error() {
-        let m = MmapRegion::new(5).unwrap();
-        let res = m.get_slice(std::usize::MAX, 3).unwrap_err();
-        assert_eq!(
-            res,
-            VolatileMemoryError::Overflow {
-                base: std::usize::MAX,
-                offset: 3,
-            }
-        );
-    }
-
-    #[test]
-    fn slice_oob_error() {
-        let m = MmapRegion::new(5).unwrap();
-        let res = m.get_slice(3, 3).unwrap_err();
-        assert_eq!(res, VolatileMemoryError::OutOfBounds { addr: 6 });
-    }
-
-    #[test]
-    fn test_write_past_end() {
-        let m = MmapRegion::new(5).unwrap();
-        let res = m.write(&[1, 2, 3, 4, 5, 6], MmapAddress(0));
-        assert!(res.is_ok());
-        assert_eq!(res.unwrap(), 5);
-    }
-
-    #[test]
-    fn slice_read_and_write() {
-        let mem_map = MmapRegion::new(5).unwrap();
-        let sample_buf = [1, 2, 3];
-        assert!(mem_map.write(&sample_buf, MmapAddress(5)).is_err());
-        assert!(mem_map.write(&sample_buf, MmapAddress(2)).is_ok());
-        let mut buf = [0u8; 3];
-        assert!(mem_map.read(&mut buf, MmapAddress(5)).is_err());
-        assert!(mem_map.read_slice(&mut buf, MmapAddress(2)).is_ok());
-        assert_eq!(buf, sample_buf);
-    }
-
-    #[test]
-    fn obj_read_and_write() {
-        let mem_map = MmapRegion::new(5).unwrap();
-        assert!(mem_map.write_obj(55u16, MmapAddress(4)).is_err());
-        assert!(mem_map
-            .write_obj(55u16, MmapAddress(core::usize::MAX))
-            .is_err());
-        assert!(mem_map.write_obj(55u16, MmapAddress(2)).is_ok());
-        assert_eq!(mem_map.read_obj::<u16>(MmapAddress(2)).unwrap(), 55u16);
-        assert!(mem_map.read_obj::<u16>(MmapAddress(4)).is_err());
-        assert!(mem_map
-            .read_obj::<u16>(MmapAddress(core::usize::MAX))
-            .is_err());
-    }
-
-    #[test]
-    fn mem_read_and_write() {
-        let mem_map = MmapRegion::new(5).unwrap();
-        assert!(mem_map.write_obj(!0u32, MmapAddress(1)).is_ok());
-        let mut file = File::open(Path::new("/dev/zero")).unwrap();
-        assert!(mem_map
-            .write_from_stream(MmapAddress(2), &mut file, mem::size_of::<u32>())
-            .is_err());
-        assert!(mem_map
-            .write_from_stream(
-                MmapAddress(core::usize::MAX),
-                &mut file,
-                mem::size_of::<u32>()
-            )
-            .is_err());
-
-        assert!(mem_map
-            .write_from_stream(MmapAddress(1), &mut file, mem::size_of::<u32>())
-            .is_ok());
-
-        let mut f = tempfile().unwrap();
-        assert!(mem_map
-            .write_from_stream(MmapAddress(1), &mut f, mem::size_of::<u32>())
-            .is_err());
-        format!(
-            "{:?}",
-            mem_map.write_from_stream(MmapAddress(1), &mut f, mem::size_of::<u32>())
-        );
-
-        assert_eq!(mem_map.read_obj::<u32>(MmapAddress(1)).unwrap(), 0);
-
-        let mut sink = Vec::new();
-        assert!(mem_map
-            .read_into_stream(MmapAddress(1), &mut sink, mem::size_of::<u32>())
-            .is_ok());
-        assert!(mem_map
-            .read_into_stream(MmapAddress(2), &mut sink, mem::size_of::<u32>())
-            .is_err());
-        assert!(mem_map
-            .read_into_stream(
-                MmapAddress(core::usize::MAX),
-                &mut sink,
-                mem::size_of::<u32>()
-            )
-            .is_err());
-        format!(
-            "{:?}",
-            mem_map.read_into_stream(MmapAddress(2), &mut sink, mem::size_of::<u32>())
-        );
-        assert_eq!(sink, vec![0; mem::size_of::<u32>()]);
     }
 
     #[test]
@@ -1040,7 +620,7 @@ mod tests {
 
         let mem_map = MmapRegion::from_fd(&f, sample_buf.len(), 0).unwrap();
         let buf = &mut [0u8; 16];
-        assert_eq!(mem_map.read(buf, MmapAddress(0)).unwrap(), sample_buf.len());
+        assert_eq!(mem_map.as_volatile_slice().read(buf, 0).unwrap(), sample_buf.len());
         assert_eq!(buf[0..sample_buf.len()], sample_buf[..]);
     }
 
@@ -1057,15 +637,6 @@ mod tests {
         let guest_mem =
             GuestMemoryMmap::new(&vec![(start_addr1, 0x400), (start_addr2, 0x400)]).unwrap();
         assert_eq!(guest_mem.num_regions(), 2);
-        assert!(guest_mem.address_in_range(GuestAddress(0x200)));
-        assert!(!guest_mem.address_in_range(GuestAddress(0x600)));
-        assert!(guest_mem.address_in_range(GuestAddress(0xa00)));
-        let end_addr = GuestAddress(0xc00);
-        assert!(!guest_mem.address_in_range(end_addr));
-        assert_eq!(guest_mem.max_addr(), end_addr);
-        assert!(guest_mem.checked_offset(start_addr1, 0x900).is_some());
-        assert!(guest_mem.checked_offset(start_addr1, 0x700).is_none());
-        assert!(guest_mem.checked_offset(start_addr2, 0xc00).is_none());
     }
 
     #[test]
@@ -1160,13 +731,13 @@ mod tests {
         let gm = GuestMemoryMmap::new(&regions).unwrap();
 
         let res: Result<()> = gm.with_regions(|_, region| {
-            assert_eq!(region.size(), region_size as GuestAddressValue);
+            assert_eq!(region.len(), region_size as GuestAddressValue);
             Ok(())
         });
         assert!(res.is_ok());
 
         let res: Result<()> = gm.with_regions_mut(|_, region| {
-            iterated_regions.push((region.min_addr(), region.size() as usize));
+            iterated_regions.push((region.min_addr(), region.len() as usize));
             Ok(())
         });
         assert!(res.is_ok());

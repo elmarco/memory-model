@@ -17,15 +17,20 @@
 //! - map a request address to a GuestMemoryRegion object and relay the request to it.
 //! - handle cases where an access request spanning two or more GuestMemoryRegion objects.
 
-use address_space::{Address, AddressRegion, AddressSpace, AddressValue};
+use address::{Address, AddressValue};
+use volatile_memory;
 use std::fmt::{self, Display};
 use std::io;
 use std::ops::{BitAnd, BitOr};
+use std::convert::From;
+use Bytes;
 
 /// Errors associated with handling guest memory accesses.
 #[allow(missing_docs)]
 #[derive(Debug)]
 pub enum Error {
+    /// Overflow in guest address arithmetic.
+    GuestAddressWraparound,
     /// Failure in finding a guest address in any memory regions mapped by this guest.
     InvalidGuestAddress(GuestAddress),
     /// Failure in finding a guest address range in any memory regions mapped by this guest.
@@ -43,12 +48,34 @@ pub enum Error {
     InvalidBackendOffset,
 }
 
+impl From<volatile_memory::Error> for Error {
+    fn from(e: volatile_memory::Error) -> Self {
+        match e {
+            volatile_memory::Error::OutOfBounds { addr: _ } =>
+                Error::InvalidBackendAddress,
+            volatile_memory::Error::Overflow { base: _, offset: _ } =>
+                Error::InvalidBackendAddress,
+            volatile_memory::Error::IOError(e) =>
+                Error::IOError(e),
+            volatile_memory::Error::PartialBuffer { expected, completed } =>
+                Error::PartialBuffer { expected: expected as u64, completed: completed as u64 }
+
+        }
+    }
+}
+
+/// Result of guest memory operations
+pub type Result<T> = std::result::Result<T, Error>;
+
 impl std::error::Error for Error {}
 
 impl Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "Guest memory error: ")?;
         match self {
+            Error::GuestAddressWraparound => {
+                write!(f, "address space wraparound")
+            }
             Error::InvalidGuestAddress(addr) => {
                 write!(f, "invalid guest address {}", addr.raw_value())
             }
@@ -89,47 +116,75 @@ pub type GuestAddressValue = <GuestAddress as AddressValue>::V;
 pub type GuestAddressOffset = <GuestAddress as AddressValue>::V;
 
 /// Represents a continuous region of guest physical memory.
-pub trait GuestMemoryRegion: AddressRegion<A = GuestAddress, E = Error> {}
+pub trait GuestMemoryRegion: Bytes<GuestAddress, E = Error> {}
 
 /// Represents a collection of GuestMemoryRegion objects.
+///
+/// Container for a set of GuestMemoryRegion objects and methods to access those objects.
 ///
 /// The main responsibilities of the GuestMemory trait are:
 /// - hide the detail of accessing guest's physical address.
 /// - map a request address to a GuestMemoryRegion object and relay the request to it.
 /// - handle cases where an access request spanning two or more GuestMemoryRegion objects.
-pub trait GuestMemory: AddressSpace<GuestAddress, Error> {
+///
+/// Note: all regions in a GuestMemory object must not intersect with each other.
+pub trait GuestMemory {
+    /// Type of objects hosted by the address space.
+    type R: Bytes<GuestAddress, E = Error>;
+
+    /// Returns the number of regions in the collection.
+    fn num_regions(&self) -> usize;
+
+    /// Return the region containing the specified address or None.
+    fn find_region(&self, GuestAddress) -> Option<&Self::R>;
+
+    /// Perform the specified action on each region.
+    /// It only walks children of current region and do not step into sub regions.
+    fn with_regions<F>(&self, cb: F) -> Result<()>
+    where
+        F: Fn(usize, &Self::R) -> Result<()>;
+
+    /// Perform the specified action on each region mutably.
+    /// It only walks children of current region and do not step into sub regions.
+    fn with_regions_mut<F>(&self, cb: F) -> Result<()>
+    where
+        F: FnMut(usize, &Self::R) -> Result<()>;
+
     /// Invoke callback `f` to handle data in the address range [addr, addr + count).
     ///
-    /// The address range [addr, addr + count) may span more than one AddressRegion objects, or
-    /// even has holes within it. So try_access() invokes the callback 'f' for each AddressRegion
+    /// The address range [addr, addr + count) may span more than one GuestMemoryRegion objects, or
+    /// even has holes within it. So try_access() invokes the callback 'f' for each GuestMemoryRegion
     /// object involved and returns:
     /// - error code returned by the callback 'f'
     /// - size of data already handled when encountering the first hole
     /// - size of data already handled when the whole range has been handled
-    fn try_access<F>(&self, count: usize, addr: GuestAddress, mut f: F) -> Result<usize, Error>
+    fn try_access<F>(&self, count: usize, addr: GuestAddress, mut f: F) -> Result<usize>
     where
-        F: FnMut(GuestAddressOffset, usize, GuestAddress, &Self::T) -> Result<usize, Error>,
+        F: FnMut(GuestAddressOffset, usize, GuestAddress, &Self::R) -> Result<usize>,
     {
         let mut cur = addr;
         let mut total = 0;
-        while total < count {
+        loop {
             if let Some(region) = self.find_region(cur) {
                 match f(total as GuestAddressOffset, count - total, cur, region) {
                     // no more data
                     Ok(0) => break,
                     // made some progress
                     Ok(len) => {
+                        total += len;
+                        if total == count {
+                            break
+                        }
                         cur = cur
                             .checked_add(len as GuestAddressValue)
-                            .ok_or_else(|| Error::InvalidGuestAddress(cur))?;
-                        total += len;
+                            .ok_or_else(|| Error::GuestAddressWraparound)?;
                     }
                     // error happened
                     e => return e,
                 }
             } else {
                 // no region for address found
-                break;
+                break
             }
         }
         Ok(total)
