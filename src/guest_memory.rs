@@ -175,10 +175,12 @@ pub trait GuestMemory {
                         if total == count {
                             break
                         }
-                        cur = cur
-                            .checked_add(len as GuestAddressValue)
-                            .ok_or_else(|| Error::GuestAddressWraparound)?;
-                    }
+                        cur = match cur.overflowing_add(len as GuestAddressValue) {
+                            (GuestAddress(0), _) => GuestAddress(0),
+                            (result, false) => result,
+                            (_, true) => return Err(Error::GuestAddressWraparound)
+                        }
+                    },
                     // error happened
                     e => return e,
                 }
